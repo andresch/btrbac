@@ -1,0 +1,256 @@
+#!/bin/bash
+
+set -e
+
+#
+# A small utility to manage incremental backups of a btrfs subvolume
+#
+# Code follows google coding styleguide (https://github.com/google/styleguide/blob/gh-pages/shell.xml)
+#
+
+function usage() {
+  echo "
+Usage:
+  $(basename "$0") -b <backup-dir> -s <subvolume> [options]
+
+  Creates a readonly snapshot of the a btrfs subvolume and archives the changes since the last backup.
+  Optionally it uploads the backup to a remote storage via rclone.
+  
+Mandatory parameters:
+  -s <subvolume>:
+    Path of the subvolume to backup 
+Options 
+  -b <backup-dir>:
+    Path where to store the backup stream
+    If missing, backup archive will not get created
+  -x <max-backup-file-size>
+    If set the backup stream is split into chunks of the given
+    maximal size.
+  -p <prefix>
+    A prefix that is used for the names of snapshots and backup archives
+    If missing the name of the subvolume directory is used
+  -n <snapshot-subvolume>
+    Path of a subvolume where to place snapshots. The path must be 
+    relative to <subvolume> and belong to the same btrfs filesystem. 
+    When necessary the subvolume will get created.
+    DEFAULT: ".snapshots"
+  -c <rclone.conf>
+    Path to rclone config files as expected by rclone --config
+    If not given, standard default of rclone is used
+  -r <rclone-remote>
+    The name of a remote location that is configured in the rclone.conf
+    If given, this parameter triggers the backup to remote storage
+  -f
+    Forces a full backup, even if incremental backup would be possible
+  -d 
+    Enables debug messages
+  -h
+    This usage information
+  
+"
+}
+
+function err() {
+  local msg="$1"
+  echo "${msg}" >&2
+  usage >&2
+  exit 1
+}
+
+
+while getopts ":s:b:x:c:r:fdn:p:h" opt; do
+  case $opt in
+    s) # path of the subvolume to backup
+      readonly SUBVOLUME_PATH="${OPTARG}"
+      ;;
+    b) # path where to store the backup stream
+      BACKUP_PATH="${OPTARG}"
+      ;;
+    x) # maximal size of a single backup fragment
+      MAX_FILE_SIZE="${OPTARG}"
+      ;;
+    c) # path to rclone config files
+      readonly RCLONE_CONFIG="${OPTARG}"
+      ;;
+    r) # trigger rclone copy of backup to given rclone remote
+      readonly RCLONE_REMOTE="${OPTARG}"
+      ;;
+    f) # force full backup
+      readonly FORCE_FULL_BACKUP=true
+      ;;
+    d) # enable debug traces
+      readonly DEBUG=true
+      set -x
+      ;;
+    n) # how to name the subvolume for the snapshots
+      SNAPSHOT_SUBVOL_NAME="${OPTARG}"
+      ;;
+    p) # prefix for snapshot and backup directories
+      PREFIX="${OPTARG}"
+      ;;
+    h)
+      usage
+      exit 0
+      ;;
+    \?)
+      err "Invalid option: -$OPTARG" 
+      ;;
+    :)
+      err "Missing argument for option -$OPTARG."
+  esac
+done
+shift "$((OPTIND-1))"
+
+# ----------------
+# Checking required parameters
+# ----------------
+
+if [[ ! -d "${SUBVOLUME_PATH}" ]] ; then
+  err "missing subvolume path; please provide parameter -s"
+fi
+
+# ----------------
+# Setting constants
+# ----------------
+
+readonly BACKUP_PATH
+
+# Name of the subvolume that contains all snapshots
+readonly SNAPSHOT_SUBVOL_NAME="${SNAPSHOT_SUBVOL_NAME:-.snapshots}"
+
+# Prefix used for individual snapshots and backup directories
+readonly PREFIX="${PREFIX:-$(basename "${SUBVOLUME_PATH}")}-"
+
+# Timestamp used in snapshot and backup names
+readonly TIMESTAMP="$(date +%Y%m%d-%H%M%S%z)"
+
+# Full name prefix for snapshots
+readonly SNAP_PREFIX="${PREFIX}snapshot-"
+
+# Full name prefix for backups
+readonly BACKUP_PREFIX="${PREFIX}backup-"
+
+
+readonly SNAPSHOT_SUBVOL="${SUBVOLUME_PATH}/${SNAPSHOT_SUBVOL_NAME}"
+
+readonly NEW_SNAPSHOT="${SNAPSHOT_SUBVOL}/${SNAP_PREFIX}${TIMESTAMP}"
+readonly LAST_SNAPSHOT="$(ls -1dr ${SNAPSHOT_SUBVOL}/${SNAP_PREFIX}* | head -1 )"
+
+readonly MAX_FILE_SIZE="${MAX_FILE_SIZE:-0}"
+
+# ----------------
+# Helper functions
+# ----------------
+
+readonly BTRFS="$(which btrfs)"
+if [[ -z "${BTRFS}" ]] ; then
+  err "can't find btrfs command"
+fi
+
+# checks if a given path points to a btrfs subvolume
+function is_subvolume() {
+  local vol_dir="$1"
+  "${BTRFS}" subvolume show "${vol_dir}" >> /dev/null 2>&1
+}
+
+# creates a btrfs subvolume at a given path
+function create_subvolume() {
+  local sub_vol="$1"
+  mkdir -p "$(dirname ${sub_vol})"
+  if ! "${BTRFS}" subvolume create "${sub_vol}" ; then
+    err "failed to create subvolume \"${sub_vol}\""
+  fi  
+}
+
+# returns the generation number for a given snapshot/subvolume
+function snapshot_generation() {
+  local snap="$1"
+  "${BTRFS}" subvolume show "${snap}" | grep "Generation" | awk '{ print $2 }' 
+}
+
+# returns the list of files in a given snapshot that have been changes since a given generation.
+function snapshot_changed_files() {
+  local snap="$1"
+  local generation="${2:-0}"
+  "${BTRFS}" subvolume find-new "${snap}" "${generation}" | awk '{ print $17 }' | sort | uniq
+}
+
+# reads stdin, compresses it and finally splits the result into individual files with a max size
+function compress_and_split() {
+  local dest="$1"
+  local size="${2:-${MAX_FILE_SIZE}}"
+  if [[ "${size}" == "0" ]] ; then
+    gzip --fast --stdout > "${dest}.gz"
+  else 
+    gzip --fast --stdout | split -b "${size}" -a 5 - "${dest}.gz."
+  fi
+}
+
+# ----------------
+# main program
+# ----------------
+
+# check that the directory we try to backup is a btrfs subvolume
+if ! is_subvolume "${SUBVOLUME_PATH}" ; then
+  err "given path \"${SUBVOLUME_PATH}\" is not a btrfs subvolume"
+fi
+
+# ensure that we have a subvolume for the snapshots
+if [[ ! -d "${SNAPSHOT_SUBVOL}" ]]; then
+  create_subvolume "${SNAPSHOT_SUBVOL}"
+fi
+
+# create the new readonly snapshot
+if ! "${BTRFS}" subvolume snapshot -r "${SUBVOLUME_PATH}" "${NEW_SNAPSHOT}" >> /dev/null 2>&1 ; then
+  err "failed to create new readonly snapshot \"${NEW_SNAPSHOT}\" for \"${SUBVOLUME_PATH}\""
+fi
+sync
+
+# if no backup destination provided, exit
+if [[ -z "${BACKUP_PATH}" ]] ; then
+  exit 0
+fi
+
+# create backup directory if missing
+if [[ ! -d "${BACKUP_PATH}" ]] && ! mkdir -p "${BACKUP_PATH}" ; then
+  err "could not create directory for backup archive"
+fi
+
+# create either full or incremental backup archive 
+if [[ "${FORCE_FULL_BACKUP}" != true && -d "${LAST_SNAPSHOT}" ]]; then
+  readonly BACKUP_DIR="${BACKUP_PREFIX}${TIMESTAMP}-incr"
+  mkdir -p "${BACKUP_PATH}/${BACKUP_DIR}"
+  snapshot_changed_files "${NEW_SNAPSHOT}" "$(snapshot_generation "${LAST_SNAPSHOT}")" > "${BACKUP_PATH}/${BACKUP_DIR}/files.txt"
+  "${BTRFS}" send -p "${LAST_SNAPSHOT}" "${NEW_SNAPSHOT}" | compress_and_split "${BACKUP_PATH}/${BACKUP_DIR}/stream.btrfs"
+else
+  readonly BACKUP_DIR="${BACKUP_PREFIX}${TIMESTAMP}-full"
+  mkdir -p "${BACKUP_PATH}/${BACKUP_DIR}"
+  snapshot_changed_files "${NEW_SNAPSHOT}" > "${BACKUP_PATH}/${BACKUP_DIR}/files.txt"
+  "${BTRFS}" send "${NEW_SNAPSHOT}" | compress_and_split "${BACKUP_PATH}/${BACKUP_DIR}/stream.btrfs"
+fi
+
+# upload to remove storage if rclone remote is specified
+if [[ -n "${RCLONE_REMOTE}" ]] ; then
+  if [[ "${DEBUG}" == "true" ]] ; then
+    verbose="-v"
+  fi
+  if [[ -n "${RCLONE_CONFIG}" ]]; then
+    # rclone tries to replace the rclone.conf file when receiving new auth token.
+    # this is not possible when config file is mounted into a docker container
+    # In that case we first create a copy and use that
+    if [[ -e "./dockerenv" ]] ; then
+      cp "${RCLONE_CONFIG}" /tmp/rclone.conf
+      config="--config /tmp/rclone.conf"
+    else
+      config="--config ${RCLONE_CONFIG}"
+    fi
+  fi
+  delay=1
+  while ! rclone copy "${BACKUP_PATH}/${BACKUP_DIR}" "${RCLONE_REMOTE}:/${BACKUP_DIR}" --checksum ${verbose} ${config} ; do
+    if [[ "${delay}" -gt 1440 ]]; then
+      err "Failed to upload backup for more than 24hrs; aborting"
+    fi
+    sleep "${delay}m"
+    delay=$((delay * 2))
+  done
+fi
