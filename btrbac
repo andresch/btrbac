@@ -46,6 +46,8 @@ Options
     Enables debug messages
   -h
     This usage information
+  --resume[=timestamp]
+    Resumes an interrupted backup
   
 "
 }
@@ -58,19 +60,28 @@ function err() {
 }
 
 
-while getopts ":s:b:x:c:r:fdn:p:h" opt; do
+while getopts ":s:b:x:c:r:fdn:p:h-:" opt; do
   case $opt in
     s) # path of the subvolume to backup
       readonly SUBVOLUME_PATH="${OPTARG}"
       ;;
     b) # path where to store the backup stream
-      BACKUP_PATH="${OPTARG}"
+      BACKUP_ROOT="${OPTARG}"
       ;;
     x) # maximal size of a single backup fragment
       MAX_FILE_SIZE="${OPTARG}"
       ;;
     c) # path to rclone config files
-      readonly RCLONE_CONFIG="${OPTARG}"
+      # rclone tries to replace the rclone.conf file when receiving new auth token.
+      # this is not possible when config file is mounted into a docker container
+      # In that case we first create a copy and use that
+      if [[ -e "/.dockerenv" ]] ; then
+        readonly RCLONE_CONFIG_ORIG="${OPTARG}"
+        cp "${RCLONE_CONFIG_ORIG}" "/tmp/rclone.conf"
+        readonly RCLONE_CONFIG="/tmp/rclone.conf"
+      else
+        readonly RCLONE_CONFIG="${OPTARG}"
+      fi
       ;;
     r) # trigger rclone copy of backup to given rclone remote
       readonly RCLONE_REMOTE="${OPTARG}"
@@ -92,6 +103,25 @@ while getopts ":s:b:x:c:r:fdn:p:h" opt; do
       usage
       exit 0
       ;;
+    -)
+      long_opt_arg="${OPTARG#*=}"
+      case "$OPTARG" in
+          help) 
+            usage
+            exit 0
+            ;;
+          resume=?*) 
+            readonly RESUME_TIMESTAMP="${long_opt_arg}"
+            readonly MODE="resume"
+            ;;
+          resume) 
+            MODE="resume"
+            ;;
+          * )       
+            err "Invalid option --$OPTARG"
+            ;;
+      esac
+      ;;    
     \?)
       err "Invalid option: -$OPTARG" 
       ;;
@@ -113,7 +143,7 @@ fi
 # Setting constants
 # ----------------
 
-readonly BACKUP_PATH
+readonly BACKUP_ROOT
 
 # Name of the subvolume that contains all snapshots
 readonly SNAPSHOT_SUBVOL_NAME="${SNAPSHOT_SUBVOL_NAME:-.snapshots}"
@@ -137,6 +167,8 @@ readonly NEW_SNAPSHOT="${SNAPSHOT_SUBVOL}/${SNAP_PREFIX}${TIMESTAMP}"
 readonly LAST_SNAPSHOT="$(ls -1dr ${SNAPSHOT_SUBVOL}/${SNAP_PREFIX}* | head -1 )"
 
 readonly MAX_FILE_SIZE="${MAX_FILE_SIZE:-0}"
+
+readonly MODE="${MODE:-backup}"
 
 # ----------------
 # Helper functions
@@ -186,6 +218,135 @@ function compress_and_split() {
   fi
 }
 
+function backup_status_file(){
+  local backup_dir="$1"
+  if [[ -n "${backup_dir}" ]] ; then
+    echo "${1}.status"
+  else
+    echo "/dev/null"
+  fi
+}
+
+function set_backup_status(){
+  local backup_dir="$1"
+  local status="$2"
+  echo "${status}" > "$(backup_status_file "${backup_dir}")"
+  sync
+}
+
+function get_backup_status(){
+  local backup_dir="$1"
+  cat "$(backup_status_file "${backup_dir}")" 2>/dev/null || echo ""
+}
+
+function clear_backup_status(){
+  local backup_dir="$1"
+  if [[ -n "${backup_dir}" ]] ; then
+    rm -f "$(backup_status_file "${backup_dir}")"
+    sync
+  fi
+}
+
+function find_pending_backups(){
+  local backup_root="$1"
+  ls -1 "${backup_root}/"*.status 2>/dev/null | sed -e "s/\\.status\$//g"
+}
+
+# prepares a new backup by creating the directory and setting some global variables
+function prepare_backup(){
+  # only backup when backup destination is provided
+  if [[ -z "${BACKUP_ROOT}" ]] ; then
+    readonly BACKUP_MODE="none"
+    readonly BACKUP_DIR=""
+  else 
+    # create backup directory if missing
+    if [[ ! -d "${BACKUP_ROOT}" ]] && ! mkdir -p "${BACKUP_ROOT}" ; then
+      err "could not create directory for backups"
+    fi
+
+    if [[ "${FORCE_FULL_BACKUP}" != true && -d "${LAST_SNAPSHOT}" ]]; then
+      readonly BACKUP_MODE="incr"
+    else
+      readonly BACKUP_MODE="full"
+    fi
+
+    readonly BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_PREFIX}${TIMESTAMP}-${BACKUP_MODE}"
+    mkdir -p "${BACKUP_DIR}"
+  fi
+}
+
+function create_readonly_snapshot(){
+  local subvolume="$1"
+  local snapshot="$2"
+  local backup_dir="$3"
+  
+  set_backup_status "${backup_dir}" "snapshot"
+  
+  # create the new readonly snapshot
+  if ! "${BTRFS}" subvolume snapshot -r "${subvolume}" "${snapshot}" >> /dev/null 2>&1 ; then
+    clear_backup_status "${backup_dir}"
+    err "failed to create new readonly snapshot \"${snapshot}\" for \"${subvolume}\""
+  fi
+  sync
+}
+
+function backup_snapshot(){
+  local mode="$1"
+  local snapshot="$2"
+  local backup_dir="$3"
+  local last_snapshot="$4"
+
+  set_backup_status "${backup_dir}" "backup"
+  
+  # create either full or incremental backup archive 
+  if [[ "${mode}" == "full" ]]; then
+    snapshot_changed_files "${snapshot}" "$(snapshot_generation "${last_snapshot}")" > "${backup_dir}/files.txt"
+    "${BTRFS}" send -p "${last_snapshot}" "${snapshot}" | compress_and_split "${backup_dir}/stream.btrfs"
+  else
+    snapshot_changed_files "${snapshot}" > "${backup_dir}/files.txt"
+    "${BTRFS}" send "${snapshot}" | compress_and_split "${backup_dir}/stream.btrfs"
+  fi
+}
+
+function rclone_backup(){
+  local backup_dir="$1"
+  local verbose="$2"
+  local config="$3"
+  
+  rclone copy "${backup_dir}" "${RCLONE_REMOTE}:/$(basename "${backup_dir}")" --checksum ${verbose} ${config}
+  
+  local exit_code=$?
+  # in case the auth token got refreshed, let's ensure that we write the new config back
+  if [[ -n "${RCLONE_CONFIG_ORIG}" ]] && diff -q "${RCLONE_CONFIG_ORIG}" "${RCLONE_CONFIG}"; then
+    cat "${RCLONE_CONFIG}" >"${RCLONE_CONFIG_ORIG}"
+  fi
+  
+  return ${exit_code}
+}
+
+function transfer_backup(){
+  local backup_dir="$1"
+  
+  set_backup_status "${backup_dir}" "transfer"
+
+  if [[ "${DEBUG}" == "true" ]] ; then
+    local verbose="-v"
+  fi
+  if [[ -n "${RCLONE_CONFIG}" ]]; then
+    local config="--config ${RCLONE_CONFIG}"
+  fi
+  
+  local delay=1
+  while ! rclone_backup "${backup_dir}" "${verbose}" "${config}" ; do
+    if [[ "${delay}" -gt 1440 ]]; then
+      err "Failed to upload backup for more than 24hrs; aborting"
+    fi
+    sleep "${delay}m"
+    delay=$((delay * 2))
+  done
+
+}
+
 # ----------------
 # main program
 # ----------------
@@ -200,57 +361,37 @@ if [[ ! -d "${SNAPSHOT_SUBVOL}" ]]; then
   create_subvolume "${SNAPSHOT_SUBVOL}"
 fi
 
-# create the new readonly snapshot
-if ! "${BTRFS}" subvolume snapshot -r "${SUBVOLUME_PATH}" "${NEW_SNAPSHOT}" >> /dev/null 2>&1 ; then
-  err "failed to create new readonly snapshot \"${NEW_SNAPSHOT}\" for \"${SUBVOLUME_PATH}\""
-fi
-sync
+case "${MODE}" in 
+  backup)
+    prepare_backup
 
-# if no backup destination provided, exit
-if [[ -z "${BACKUP_PATH}" ]] ; then
-  exit 0
-fi
+    create_readonly_snapshot "${SUBVOLUME_PATH}" "${NEW_SNAPSHOT}" "${BACKUP_DIR}"
 
-# create backup directory if missing
-if [[ ! -d "${BACKUP_PATH}" ]] && ! mkdir -p "${BACKUP_PATH}" ; then
-  err "could not create directory for backup archive"
-fi
+    if [[ "${BACKUP_MODE}" != "none" ]] ; then
 
-# create either full or incremental backup archive 
-if [[ "${FORCE_FULL_BACKUP}" != true && -d "${LAST_SNAPSHOT}" ]]; then
-  readonly BACKUP_DIR="${BACKUP_PREFIX}${TIMESTAMP}-incr"
-  mkdir -p "${BACKUP_PATH}/${BACKUP_DIR}"
-  snapshot_changed_files "${NEW_SNAPSHOT}" "$(snapshot_generation "${LAST_SNAPSHOT}")" > "${BACKUP_PATH}/${BACKUP_DIR}/files.txt"
-  "${BTRFS}" send -p "${LAST_SNAPSHOT}" "${NEW_SNAPSHOT}" | compress_and_split "${BACKUP_PATH}/${BACKUP_DIR}/stream.btrfs"
-else
-  readonly BACKUP_DIR="${BACKUP_PREFIX}${TIMESTAMP}-full"
-  mkdir -p "${BACKUP_PATH}/${BACKUP_DIR}"
-  snapshot_changed_files "${NEW_SNAPSHOT}" > "${BACKUP_PATH}/${BACKUP_DIR}/files.txt"
-  "${BTRFS}" send "${NEW_SNAPSHOT}" | compress_and_split "${BACKUP_PATH}/${BACKUP_DIR}/stream.btrfs"
-fi
+      backup_snapshot "${BACKUP_MODE}" "${NEW_SNAPSHOT}" "${BACKUP_DIR}" "${LAST_SNAPSHOT}"
 
-# upload to remove storage if rclone remote is specified
-if [[ -n "${RCLONE_REMOTE}" ]] ; then
-  if [[ "${DEBUG}" == "true" ]] ; then
-    verbose="-v"
-  fi
-  if [[ -n "${RCLONE_CONFIG}" ]]; then
-    # rclone tries to replace the rclone.conf file when receiving new auth token.
-    # this is not possible when config file is mounted into a docker container
-    # In that case we first create a copy and use that
-    if [[ -e "/.dockerenv" ]] ; then
-      cp "${RCLONE_CONFIG}" /tmp/rclone.conf
-      config="--config /tmp/rclone.conf"
-    else
-      config="--config ${RCLONE_CONFIG}"
+      # upload to remove storage if rclone remote is specified
+      if [[ -n "${RCLONE_REMOTE}" ]] ; then
+        transfer_backup "${BACKUP_DIR}"
+      fi
+
     fi
-  fi
-  delay=1
-  while ! rclone copy "${BACKUP_PATH}/${BACKUP_DIR}" "${RCLONE_REMOTE}:/${BACKUP_DIR}" --checksum ${verbose} ${config} ; do
-    if [[ "${delay}" -gt 1440 ]]; then
-      err "Failed to upload backup for more than 24hrs; aborting"
-    fi
-    sleep "${delay}m"
-    delay=$((delay * 2))
-  done
-fi
+
+    clear_backup_status "${BACKUP_DIR}"
+    ;;
+  resume)
+    for backup in $(find_pending_backups "${BACKUP_ROOT}"); do
+      case "$(get_backup_status "${backup}")" in
+        snapshot)
+          ;;
+        backup)
+          local mode="sdf"
+          ;;
+        transfer)
+          transfer_backup "${backup}"
+          ;;
+      esac
+    done
+    ;;
+esac
