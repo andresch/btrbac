@@ -238,7 +238,7 @@ if [[ -n "${RCLONE_REMOTE}" ]] ; then
     # rclone tries to replace the rclone.conf file when receiving new auth token.
     # this is not possible when config file is mounted into a docker container
     # In that case we first create a copy and use that
-    if [[ -e "./dockerenv" ]] ; then
+    if [[ -e "/.dockerenv" ]] ; then
       cp "${RCLONE_CONFIG}" /tmp/rclone.conf
       config="--config /tmp/rclone.conf"
     else
